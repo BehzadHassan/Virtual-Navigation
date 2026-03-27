@@ -18,7 +18,6 @@ Gesture catalogue
 import math
 import time
 import numpy as np
-from mediapipe.framework.formats import landmark_pb2
 
 
 # ── landmark index constants ────────────────────────────────────────────────

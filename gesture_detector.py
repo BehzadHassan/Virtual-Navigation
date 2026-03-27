@@ -1,57 +1,61 @@
 """
-gesture_detector.py
-────────────────────
-Wraps the MediaPipe Hands pipeline.
+gesture_detector.py  (mediapipe.tasks version)
+────────────────────────────────────────────────
+Uses the new MediaPipe Tasks API (mediapipe.tasks.python.vision.HandLandmarker)
+which works on Python 3.14 / mediapipe 0.10+.
 
-Usage
------
-    detector = GestureDetector()
-    annotated_frame, landmarks, handedness = detector.detect(bgr_frame)
+Model file:  hand_landmarker.task  (must sit next to this script)
+Download:    https://storage.googleapis.com/mediapipe-models/hand_landmarker/
+             hand_landmarker/float16/latest/hand_landmarker.task
 """
 
+import os
 import cv2
-import mediapipe as mp
+import math
 import numpy as np
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.components.containers import landmark as _lm_mod
+
+# ── Colour constants ─────────────────────────────────────────────────────────
+_JOINT_COLOR = (0, 245, 212)    # cyan-green
+_BONE_COLOR  = (180, 58, 228)   # purple
+_TIP_COLOR   = (255, 255, 0)    # yellow
+
+# Hand connection pairs (same indices as mp.solutions.hands)
+_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),          # thumb
+    (0,5),(5,6),(6,7),(7,8),          # index
+    (9,10),(10,11),(11,12),           # middle
+    (5,9),(9,13),(13,17),(0,17),      # palm
+    (13,14),(14,15),(15,16),          # ring
+    (17,18),(18,19),(19,20),          # pinky
+]
+
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
 
 class GestureDetector:
-    """Real-time single-hand landmark detector using MediaPipe Hands."""
-
-    # Neon palette for skeleton overlay
-    _JOINT_COLOR  = (0, 245, 212)   # cyan-green  #00f5d4
-    _BONE_COLOR   = (180, 58, 228)  # purple      #b43ae4
-    _TIP_COLOR    = (255, 255, 0)   # yellow for fingertips
-
-    # Fingertip & knuckle landmark indices
-    _TIPS    = [4, 8, 12, 16, 20]
-    _MCPS    = [1, 5, 9, 13, 17]
+    """Real-time single-hand landmark detector — mediapipe.tasks API."""
 
     def __init__(
         self,
-        max_num_hands: int = 1,
-        model_complexity: int = 1,
-        min_detection_confidence: float = 0.7,
-        min_tracking_confidence: float = 0.6,
+        model_path: str = _MODEL_PATH,
+        num_hands:  int = 1,
+        min_hand_detection_confidence: float = 0.6,
+        min_tracking_confidence:       float = 0.5,
     ):
-        self._mp_hands = mp.solutions.hands
-        self._mp_draw  = mp.solutions.drawing_utils
-        self._mp_styles = mp.solutions.drawing_styles
-
-        self._hands = self._mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=max_num_hands,
-            model_complexity=model_complexity,
-            min_detection_confidence=min_detection_confidence,
+        base_opts = mp_python.BaseOptions(model_asset_path=model_path)
+        opts = mp_vision.HandLandmarkerOptions(
+            base_options=base_opts,
+            running_mode=mp_vision.RunningMode.IMAGE,   # per-frame sync
+            num_hands=num_hands,
+            min_hand_detection_confidence=min_hand_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
-
-        # Custom drawing specs
-        self._joint_spec = self._mp_draw.DrawingSpec(
-            color=self._JOINT_COLOR, thickness=2, circle_radius=4
-        )
-        self._bone_spec = self._mp_draw.DrawingSpec(
-            color=self._BONE_COLOR, thickness=2, circle_radius=2
-        )
+        self._landmarker = mp_vision.HandLandmarker.create_from_options(opts)
 
     # ------------------------------------------------------------------ #
 
@@ -61,55 +65,49 @@ class GestureDetector:
 
         Returns
         -------
-        annotated_frame : np.ndarray  – frame with skeleton drawn on it
-        landmarks_list  : list | None – list of 21 NormalizedLandmarks or None
+        annotated_frame : np.ndarray  – frame with skeleton
+        landmarks       : list | None – list of NormalizedLandmark (21) or None
         handedness      : str  | None – 'Left' / 'Right' or None
         """
         h, w = bgr_frame.shape[:2]
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = self._hands.process(rgb)
-        rgb.flags.writeable = True
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        result = self._landmarker.detect(mp_image)
+
         annotated = bgr_frame.copy()
 
-        if not results.multi_hand_landmarks:
+        if not result.hand_landmarks:
             return annotated, None, None
 
-        # Take first detected hand only
-        hand_lms = results.multi_hand_landmarks[0]
+        raw_lms = result.hand_landmarks[0]   # list of NormalizedLandmark
 
-        # Draw skeleton with glow effect (draw thick layer first)
-        glow_bone = self._mp_draw.DrawingSpec(
-            color=self._BONE_COLOR, thickness=6, circle_radius=2
-        )
-        glow_joint = self._mp_draw.DrawingSpec(
-            color=self._JOINT_COLOR, thickness=6, circle_radius=6
-        )
-        self._mp_draw.draw_landmarks(
-            annotated, hand_lms,
-            self._mp_hands.HAND_CONNECTIONS,
-            glow_joint, glow_bone,
-        )
-        self._mp_draw.draw_landmarks(
-            annotated, hand_lms,
-            self._mp_hands.HAND_CONNECTIONS,
-            self._joint_spec, self._bone_spec,
-        )
+        # ── Draw skeleton ─────────────────────────────────────────────────
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in raw_lms]
 
-        # Highlight fingertips with bright circles
-        for tip_idx in self._TIPS:
-            lm = hand_lms.landmark[tip_idx]
-            cx, cy = int(lm.x * w), int(lm.y * h)
-            cv2.circle(annotated, (cx, cy), 8, self._TIP_COLOR, -1)
-            cv2.circle(annotated, (cx, cy), 10, (255, 255, 255), 1)
+        # Glow pass (thick)
+        for a, b in _CONNECTIONS:
+            cv2.line(annotated, pts[a], pts[b], _BONE_COLOR, 5, cv2.LINE_AA)
+        for pt in pts:
+            cv2.circle(annotated, pt, 6, _JOINT_COLOR, -1, cv2.LINE_AA)
 
-        handedness_label = (
-            results.multi_handedness[0].classification[0].label
-            if results.multi_handedness else None
-        )
+        # Sharp pass (thin)
+        for a, b in _CONNECTIONS:
+            cv2.line(annotated, pts[a], pts[b], _BONE_COLOR, 2, cv2.LINE_AA)
+        for pt in pts:
+            cv2.circle(annotated, pt, 3, _JOINT_COLOR, -1, cv2.LINE_AA)
 
-        return annotated, hand_lms.landmark, handedness_label
+        # Fingertip highlights
+        for tip_idx in [4, 8, 12, 16, 20]:
+            pt = pts[tip_idx]
+            cv2.circle(annotated, pt, 9, _TIP_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(annotated, pt, 11, (255, 255, 255), 1, cv2.LINE_AA)
+
+        handedness = None
+        if result.handedness:
+            handedness = result.handedness[0][0].display_name   # 'Left' / 'Right'
+
+        return annotated, raw_lms, handedness
 
     def release(self):
-        """Release MediaPipe resources."""
-        self._hands.close()
+        self._landmarker.close()
